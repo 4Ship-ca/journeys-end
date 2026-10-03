@@ -22,8 +22,11 @@ npm run dev        # http://localhost:5173
 npm run lint
 npm run typecheck
 npm test           # vitest: logic, data integrity and API route tests with mocked upstreams
+npm run test:live  # opt-in: the API routes against the real providers (needs network access)
 npm run build      # Worker output in dist/
 ```
+
+`npm run test:live` calls MET Norway, Wikipedia, Internet Archive and the museum pages for real. It is not part of CI. Behind an HTTPS proxy, run it as `NODE_USE_ENV_PROXY=1 npm run test:live`; add `NODE_EXTRA_CA_CERTS=<bundle>` if the proxy re-signs TLS.
 
 CI runs the same checks on every push and pull request (`.github/workflows/ci.yml`).
 

@@ -33,7 +33,7 @@ Chromium via Playwright against `npm run dev`, with fixture API responses and ag
 - offline: no forecast invented, access stays unconfirmed, research and anniversary errors explained;
 - no console errors or hydration warnings (other than third-party fonts and map tiles blocked by the sandbox network).
 
-Live calls to MET Norway, Wikipedia, Internet Archive and the museum sites were **not** exercised: the build environment's network policy blocks those hosts. Recheck the deployed Worker against real providers before public release.
+Live calls to MET Norway, Wikipedia, Internet Archive and the museum sites were **not** exercised: the build environment's network policy blocks those hosts (the proxy answers 403). `npm run test:live` runs the real API routes against the real providers. It needs access to `api.met.no`, `en.wikipedia.org`, `archive.org`, `www.warplane.com` and `global.honda`. Run it wherever those hosts are reachable, and recheck the deployed Worker before public release.
 
 ## Still open from Phase 1 / known gaps
 
