@@ -23,6 +23,14 @@ const eslintConfig = defineConfig([
       "react-hooks/set-state-in-effect": "off",
     },
   },
+  {
+    files: ["app/**/*.{ts,tsx}"],
+    rules: {
+      // The Worker build serves pre-sized local photographs with explicit
+      // width/height; there is no next/image optimiser configured for it.
+      "@next/next/no-img-element": "off",
+    },
+  },
 ]);
 
 export default eslintConfig;

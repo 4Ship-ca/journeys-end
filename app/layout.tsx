@@ -1,8 +1,9 @@
 import type { Metadata } from "next";
 import "./globals.css";
+import { DEFAULT_TITLE } from "../lib/detour/titles";
 
 export const metadata: Metadata = {
-  title: "Worth the Detour — Your interests, out in the world",
+  title: DEFAULT_TITLE,
   description: "Explore aviation, history and worthwhile detours. Build a personal journey with sourced discoveries and live conditions.",
   other: {
     "codex-preview": "development",

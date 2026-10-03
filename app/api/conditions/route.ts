@@ -1,15 +1,71 @@
-import {byId} from '../../data';
-const cache=new Map<string,{expires:number;data:unknown}>();
-async function get(url:string){const r=await fetch(url,{headers:{'User-Agent':'WorthTheDetour/1.0 (+https://4ship.ca)'},signal:AbortSignal.timeout(9000)});if(!r.ok)throw new Error('Source unavailable');return r;}
-export async function GET(request:Request){
- const u=new URL(request.url);const id=u.searchParams.get('id')||'warplane';const p=byId[id];if(!p)return Response.json({error:'Unknown location'},{status:400});
- const hit=cache.get(id);if(hit&&hit.expires>Date.now())return Response.json(hit.data);
- const checkedAt=new Date().toISOString();
- const [wx,site]=await Promise.allSettled([p.lat!==undefined?get(`https://api.met.no/weatherapi/locationforecast/2.0/compact?lat=${p.lat}&lon=${p.lon}`).then(r=>r.json() as Promise<any>):Promise.resolve(null),get(p.source).then(r=>r.text())]);
- let weather=null;
- if(wx.status==='fulfilled'&&wx.value?.properties?.timeseries){const v=wx.value;weather={updatedAt:v.properties.meta.updated_at,points:v.properties.timeseries.slice(0,100).map((x:any)=>({time:x.time,temp:x.data.instant.details.air_temperature,wind:Math.round(x.data.instant.details.wind_speed*3.6),symbol:x.data.next_1_hours?.summary?.symbol_code??x.data.next_6_hours?.summary?.symbol_code??''}))};}
- let notices:string[]=[];
- if(site.status==='fulfilled'){const clean=site.value.replace(/<script\b[^>]*>[\s\S]*?<\/script>/gi,' ').replace(/<style\b[^>]*>[\s\S]*?<\/style>/gi,' ').replace(/<[^>]+>/g,' ').replace(/&nbsp;|&#160;/g,' ').replace(/&amp;/g,'&').replace(/\s+/g,' ');const match=clean.match(/.{0,35}\b(?:temporarily closed|closure|closed today|cancelled|canceled|maintenance)\b.{0,85}/gi)||[];notices=match.slice(0,2).map(s=>s.split(' ').slice(0,12).join(' '));}
- const data={checkedAt,source:p.source,sourceFetched:site.status==='fulfilled',access:'unconfirmed',notices,weather,weatherError:weather?null:p.lat?'Weather is unavailable. Try again later.':'Choose a mapped place for a local forecast.'};
- cache.set(id,{expires:Date.now()+15*60*1000,data});return Response.json(data,{headers:{'Cache-Control':'private, max-age=60'}});
+import { getEntry, getPlace, sourceHosts } from "../../data";
+import type { ConditionsResponse, WeatherReport } from "../../../lib/detour/api";
+import { TtlCache } from "../../../lib/detour/server/cache";
+import { parseForecast } from "../../../lib/detour/server/forecast";
+import { NOTICE_SCOPE, extractNotices } from "../../../lib/detour/server/notices";
+import { jsonError, jsonOk } from "../../../lib/detour/server/responses";
+import { fetchJson, fetchText } from "../../../lib/detour/server/upstream";
+
+const FRESH_MS = 15 * 60 * 1000;
+/** A failed refresh may fall back to a forecast retrieved within this window, labelled stale. */
+const STALE_MS = 6 * 60 * 60 * 1000;
+
+const cache = new TtlCache<Omit<ConditionsResponse, "cached">>(FRESH_MS, STALE_MS, 50);
+
+export async function GET(request: Request): Promise<Response> {
+  const id = new URL(request.url).searchParams.get("id");
+  if (!id) {
+    return jsonError(400, { code: "missing_id", message: "Choose a place to check." });
+  }
+  if (!/^[a-z0-9-]{1,40}$/.test(id) || !getEntry(id)) {
+    return jsonError(400, { code: "unknown_place", message: "This place is not in the guide." });
+  }
+  const place = getPlace(id);
+  if (!place) {
+    return jsonError(400, { code: "not_a_place", message: "Conditions are only available for mapped places." });
+  }
+
+  const now = Date.now();
+  const hit = cache.get(id, now);
+  if (hit?.fresh) return jsonOk({ ...hit.value, cached: true }, "private, max-age=60");
+
+  const [forecast, page] = await Promise.allSettled([
+    fetchJson(
+      `https://api.met.no/weatherapi/locationforecast/2.0/compact?lat=${place.lat.toFixed(4)}&lon=${place.lon.toFixed(4)}`,
+      { timeoutMs: 9_000, maxBytes: 2_000_000, allowedHosts: ["api.met.no"] },
+    ),
+    fetchText(place.source, {
+      timeoutMs: 9_000,
+      maxBytes: 2_000_000,
+      allowedHosts: sourceHosts(place),
+      accept: "text/html,application/xhtml+xml",
+      contentTypes: ["text/html", "application/xhtml+xml", "text/plain"],
+    }),
+  ]);
+
+  const checkedAt = new Date(now).toISOString();
+  let weather: WeatherReport | null = null;
+  if (forecast.status === "fulfilled") {
+    const parsed = parseForecast(forecast.value.data);
+    if (parsed.points.length) weather = { state: "current", updatedAt: parsed.updatedAt, fetchedAt: checkedAt, points: parsed.points };
+  }
+  if (!weather && hit?.value.weather) {
+    weather = { ...hit.value.weather, state: "stale" };
+  }
+
+  const body: Omit<ConditionsResponse, "cached"> = {
+    id,
+    checkedAt,
+    source: place.source,
+    sourceFetched: page.status === "fulfilled",
+    access: "unconfirmed",
+    notices: page.status === "fulfilled" ? extractNotices(page.value.text) : [],
+    noticeScope: NOTICE_SCOPE,
+    timeZone: place.timeZone,
+    weather,
+    weatherError: weather ? null : "Weather is unavailable. Try again later.",
+  };
+
+  if (weather?.state === "current") cache.set(id, body, now);
+  return jsonOk({ ...body, cached: false }, weather?.state === "current" ? "private, max-age=60" : "no-store");
 }

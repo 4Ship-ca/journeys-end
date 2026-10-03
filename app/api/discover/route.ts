@@ -1,10 +1,110 @@
-async function get(url:string):Promise<any>{const r=await fetch(url,{headers:{'User-Agent':'WorthTheDetour/1.0 (+https://4ship.ca)'},signal:AbortSignal.timeout(10000)});if(!r.ok)throw Error('Source unavailable');return r.json();}
-export async function GET(request:Request){
-const u=new URL(request.url);let q=(u.searchParams.get('q')||'aviation').trim().slice(0,100);const day=u.searchParams.get('day');
-if(day){if(!/^\d{2}-\d{2}$/.test(day))return Response.json({error:'Invalid date'},{status:400});try{const d=await get('https://en.wikipedia.org/api/rest_v1/feed/onthisday/events/'+day.replace('-','/'));const events=(d.events||[]).filter((x:any)=>/aircraft|aviation|flight|airport|spacecraft|satellite|automobile|railway|motor|NASA|air force/i.test(x.text)).slice(0,8).map((x:any)=>({year:x.year,text:x.text,url:x.pages?.[0]?.content_urls?.desktop?.page||'https://en.wikipedia.org'}));return Response.json({events,checkedAt:new Date().toISOString()});}catch{return Response.json({events:[],error:'Anniversary source unavailable. Try a subject instead.'});}}
-q=q.replace(/["\\{}:]/g,' ');const aq=encodeURIComponent(q+' AND (mediatype:movies OR mediatype:texts)');
-const [ar,wi]=await Promise.allSettled([get(`https://archive.org/advancedsearch.php?q=${aq}&fl[]=identifier&fl[]=title&fl[]=year&rows=5&output=json`),get(`https://en.wikipedia.org/w/api.php?action=query&list=search&srsearch=${encodeURIComponent(q)}&srlimit=4&format=json`)]);
-const archive=ar.status==='fulfilled'?(ar.value.response?.docs||[]).map((d:any)=>({title:d.title,url:'https://archive.org/details/'+encodeURIComponent(d.identifier),type:'Internet Archive',year:d.year})):[];
-const background=wi.status==='fulfilled'?(wi.value.query?.search||[]).map((d:any)=>({title:d.title,url:'https://en.wikipedia.org/?curid='+d.pageid,type:'Background · Wikipedia'})):[];
-return Response.json({results:[...archive,...background],partial:ar.status==='rejected'||wi.status==='rejected',checkedAt:new Date().toISOString()});
+import type { AnniversaryResponse, DiscoverResponse, SourceStatus } from "../../../lib/detour/api";
+import { isValidMonthDay } from "../../../lib/detour/dates";
+import { TtlCache } from "../../../lib/detour/server/cache";
+import {
+  ARCHIVE_ROWS,
+  WIKIPEDIA_ROWS,
+  mapArchiveDocs,
+  mapOnThisDay,
+  mapWikipediaSearch,
+  onThisDayPageUrl,
+  sanitizeQuery,
+} from "../../../lib/detour/server/research";
+import { jsonError, jsonOk } from "../../../lib/detour/server/responses";
+import { fetchJson } from "../../../lib/detour/server/upstream";
+
+const ARCHIVE_HOSTS = ["archive.org"];
+const WIKIPEDIA_HOSTS = ["en.wikipedia.org"];
+
+const researchCache = new TtlCache<Omit<DiscoverResponse, "cached">>(10 * 60 * 1000, 10 * 60 * 1000, 200);
+const dayCache = new TtlCache<Omit<AnniversaryResponse, "cached">>(6 * 60 * 60 * 1000, 6 * 60 * 60 * 1000, 400);
+
+async function anniversaries(day: string): Promise<Response> {
+  const now = Date.now();
+  const hit = dayCache.get(day, now);
+  if (hit?.fresh) return jsonOk({ ...hit.value, cached: true }, "public, max-age=3600");
+  const [month, date] = day.split("-");
+  try {
+    const { data } = await fetchJson(`https://en.wikipedia.org/api/rest_v1/feed/onthisday/events/${month}/${date}`, {
+      timeoutMs: 10_000,
+      maxBytes: 4_000_000,
+      allowedHosts: WIKIPEDIA_HOSTS,
+    });
+    const body: Omit<AnniversaryResponse, "cached"> = {
+      day,
+      events: mapOnThisDay(data),
+      source: "Wikipedia · On this day",
+      sourceUrl: onThisDayPageUrl(day),
+      checkedAt: new Date(now).toISOString(),
+    };
+    dayCache.set(day, body, now);
+    return jsonOk({ ...body, cached: false }, "public, max-age=3600");
+  } catch {
+    return jsonError(
+      502,
+      { code: "upstream_unavailable", message: "The anniversary source could not be reached. Try a subject instead." },
+      { day, events: [] },
+    );
+  }
+}
+
+async function research(query: string): Promise<Response> {
+  const now = Date.now();
+  const key = query.toLowerCase();
+  const hit = researchCache.get(key, now);
+  if (hit?.fresh) return jsonOk({ ...hit.value, cached: true }, "public, max-age=300");
+  const archiveQuery = encodeURIComponent(`(${query}) AND mediatype:(movies OR texts)`);
+  const [archive, wikipedia] = await Promise.allSettled([
+    fetchJson(
+      `https://archive.org/advancedsearch.php?q=${archiveQuery}&fl[]=identifier&fl[]=title&fl[]=year&rows=${ARCHIVE_ROWS}&output=json`,
+      { timeoutMs: 10_000, maxBytes: 1_000_000, allowedHosts: ARCHIVE_HOSTS },
+    ),
+    fetchJson(
+      `https://en.wikipedia.org/w/api.php?action=query&list=search&srsearch=${encodeURIComponent(query)}&srlimit=${WIKIPEDIA_ROWS}&format=json`,
+      { timeoutMs: 10_000, maxBytes: 1_000_000, allowedHosts: WIKIPEDIA_HOSTS },
+    ),
+  ]);
+  const archiveResults = archive.status === "fulfilled" ? mapArchiveDocs(archive.value.data) : [];
+  const wikipediaResults = wikipedia.status === "fulfilled" ? mapWikipediaSearch(wikipedia.value.data) : [];
+  const sources: SourceStatus[] = [
+    { name: "Internet Archive", status: archive.status === "fulfilled" ? "ok" : "unavailable", count: archiveResults.length },
+    { name: "Wikipedia", status: wikipedia.status === "fulfilled" ? "ok" : "unavailable", count: wikipediaResults.length },
+  ];
+  const checkedAt = new Date(now).toISOString();
+  if (archive.status === "rejected" && wikipedia.status === "rejected") {
+    return jsonError(
+      502,
+      { code: "upstream_unavailable", message: "Live research is unavailable. You can still open the source searches." },
+      { query, results: [], sources, partial: true },
+    );
+  }
+  const body: Omit<DiscoverResponse, "cached"> = {
+    query,
+    results: [...archiveResults, ...wikipediaResults],
+    sources,
+    partial: archive.status === "rejected" || wikipedia.status === "rejected",
+    checkedAt,
+  };
+  if (!body.partial) researchCache.set(key, body, now);
+  return jsonOk({ ...body, cached: false }, body.partial ? "no-store" : "public, max-age=300");
+}
+
+export async function GET(request: Request): Promise<Response> {
+  const params = new URL(request.url).searchParams;
+  const day = params.get("day");
+  if (day !== null) {
+    if (!isValidMonthDay(day)) {
+      return jsonError(400, { code: "invalid_date", message: "Use a real calendar date in MM-DD form." }, { events: [] });
+    }
+    return anniversaries(day);
+  }
+  const raw = params.get("q");
+  if (raw === null || !raw.trim()) {
+    return jsonError(400, { code: "missing_query", message: "Enter a subject to research." }, { results: [] });
+  }
+  const query = sanitizeQuery(raw);
+  if (!query) {
+    return jsonError(400, { code: "invalid_query", message: "Use plain words to describe the subject." }, { results: [] });
+  }
+  return research(query);
 }
